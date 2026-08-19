@@ -1,0 +1,11 @@
+# Lauf-Artefakte — Pfade, PIDs, Portlisten sind lokal-spezifisch
+state.json
+reports/
+
+# Python
+__pycache__/
+*.pyc
+
+# macOS
+.DS_Store
+Icon?
