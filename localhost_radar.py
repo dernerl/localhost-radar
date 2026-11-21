@@ -8,12 +8,22 @@ TCP socket (no filtering to "known" dev runtimes — that would miss exactly the
 forgotten Docker DB it's meant to catch) and maps each one back to the process
 and, where resolvable, the project directory it's running from.
 
+Every port is classified as "app" (a local web app you run: answers HTTP with
+HTML and runs from a project directory or a Docker container) or "program"
+(background services of installed apps, IDE/CLI helper sockets, …). The scan
+itself stays unfiltered; the classification only drives what displays show.
+
 Writes state.json (machine-readable) and reports/latest.md (human-readable).
 """
+from __future__ import annotations
+
 import json
 import os
 import re
 import subprocess
+import urllib.error
+import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -91,6 +101,45 @@ def cwd_for_pid(pid: int) -> str | None:
     return None
 
 
+def docker_ports() -> dict[int, str]:
+    """Host port -> project dir of the container publishing it (Docker/OrbStack).
+
+    The listening process is the VM helper (cwd "/"), so the project comes from the
+    compose working dir, lifted to its git toplevel (compose files often sit in a
+    `deployment/` subfolder).
+    """
+    fmt = '{{.Ports}}\t{{.Label "com.docker.compose.project.working_dir"}}\t{{.Names}}'
+    rc, out = run(["docker", "ps", "--format", fmt], timeout=5)
+    mapping: dict[int, str] = {}
+    for line in out.splitlines():
+        ports, workdir, name = (line.split("\t") + ["", ""])[:3]
+        project = workdir or name
+        if workdir:
+            rc2, top = run(["git", "-C", workdir, "rev-parse", "--show-toplevel"], timeout=5)
+            project = top.strip() if rc2 == 0 and top.strip() else workdir
+        for host_port in re.findall(r":(\d+)->", ports):
+            mapping[int(host_port)] = project
+    return mapping
+
+
+def serves_html(port: int) -> bool:
+    """True if GET / answers with an HTML page (any status) — i.e. a web UI, not an API/IPC socket."""
+    req = urllib.request.Request(f"http://127.0.0.1:{port}/", headers={"User-Agent": "localhost-radar"})
+    try:
+        with urllib.request.urlopen(req, timeout=1.5) as resp:
+            ctype = resp.headers.get("Content-Type") or ""
+    except urllib.error.HTTPError as e:
+        ctype = e.headers.get("Content-Type") or ""
+    except Exception:
+        return False
+    return ctype.lower().startswith("text/html")
+
+
+def is_project_dir(cwd: str | None) -> bool:
+    """A real working directory — not "/" (menu bar agents) and not inside an .app bundle."""
+    return bool(cwd) and cwd != "/" and ".app/" not in cwd + "/"
+
+
 def bind_kind(addr: str) -> str:
     if addr in LOOPBACK_ADDRS or addr.startswith("127."):
         return "loopback"
@@ -127,28 +176,41 @@ def check() -> dict:
             "project": project,
         }
 
+    docker = docker_ports()
+    for e in seen.values():
+        if e["port"] in docker:
+            e["cwd"] = docker[e["port"]]
+            e["project"] = Path(docker[e["port"]]).name
+            e["docker"] = True
+    with ThreadPoolExecutor(max_workers=16) as pool:
+        html = dict(zip(seen, pool.map(lambda e: serves_html(e["port"]), seen.values())))
+    for key, e in seen.items():
+        e["kind"] = "app" if html[key] and is_project_dir(e["cwd"]) else "program"
+
     ports = sorted(seen.values(), key=lambda e: e["port"])
-    severity = "orange" if any(e["bind"] == "exposed" for e in ports) else "green"
+    # Only apps count: an exposed helper socket of an installed program is not actionable.
+    severity = "orange" if any(e["bind"] == "exposed" and e["kind"] == "app" for e in ports) else "green"
 
     return {
         "generated": datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds"),
         "severity": severity,
         "count": len(ports),
+        "app_count": sum(1 for e in ports if e["kind"] == "app"),
         "ports": ports,
     }
 
 
 def render_report(state: dict) -> str:
     lines = [f"# localhost-radar — {state['generated']}", "",
-             f"**{state['count']} Ports lauschen aktuell.**", ""]
+             f"**{state['count']} Ports lauschen aktuell, davon {state['app_count']} Apps.**", ""]
     if not state["ports"]:
         lines.append("_(keine)_")
         return "\n".join(lines) + "\n"
-    lines.append("| Port | Projekt | Kommando | Bind | PID |")
-    lines.append("|---|---|---|---|---|")
+    lines.append("| Port | Art | Projekt | Kommando | Bind | PID |")
+    lines.append("|---|---|---|---|---|---|")
     for e in state["ports"]:
         bind_mark = "🌐 exposed" if e["bind"] == "exposed" else "🏠 loopback"
-        lines.append(f"| {e['port']} | {e['project'] or '—'} | {e['command']} | "
+        lines.append(f"| {e['port']} | {e['kind']} | {e['project'] or '—'} | {e['command']} | "
                       f"{bind_mark} | {e['pid']} |")
     return "\n".join(lines) + "\n"
 
@@ -159,7 +221,7 @@ def main() -> None:
     REPORT_PATH.parent.mkdir(exist_ok=True)
     REPORT_PATH.write_text(render_report(state), encoding="utf-8")
     exposed = sum(1 for e in state["ports"] if e["bind"] == "exposed")
-    print(f"count={state['count']} exposed={exposed}")
+    print(f"count={state['count']} apps={state['app_count']} exposed={exposed}")
 
 
 if __name__ == "__main__":
